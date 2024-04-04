@@ -67,39 +67,6 @@ class InstanceNorm(Module):
         return (self.weight * x + self.bias) if "weight" in self else x
 
 
-@partial(mx.compile, shapeless=True)
-def ln_norm(x, eps, weight=None, bias=None):
-    """
-    Layer normalization for input tensor x.
-
-    Args:
-        x (np.ndarray): Input tensor.
-        eps (float, optional): Small value to avoid division by zero.
-        weight (np.ndarray, optional): Weight tensor for normalization.
-        bias (np.ndarray, optional): Bias tensor for normalization.
-
-    Returns:
-        np.ndarray: Normalized tensor.
-    """
-    t = x.dtype
-    x = x.astype(mx.float32)
-
-    # Compute mean and variance along the last dimension
-    means = mx.mean(x, axis=-1, keepdims=True)
-    var = mx.var(x, axis=-1, keepdims=True)
-
-    # Normalize the input tensor
-    x = (x - means) * mx.rsqrt(var + eps)
-    x = x.astype(t)
-
-    # Apply weight and bias if provided
-    if weight is not None:
-        x = x * weight
-    if bias is not None:
-        x = x + bias
-    return x
-
-
 class LayerNorm(Module):
     r"""Applies layer normalization [1] on the inputs.
 
@@ -109,13 +76,13 @@ class LayerNorm(Module):
 
         y = \frac{x - E[x]}{\sqrt{Var[x]} + \epsilon} \gamma + \beta,
 
-    where :math:`\gamma` and :math:`\beta` are learned per feature dimension
+    where :math:`\gamma` and :math:`\beta` are learned per feature dimension or along the height and width dimensions for 2D inputs
     parameters initialized at 1 and 0 respectively.
 
     [1]: https://arxiv.org/abs/1607.06450
 
     Args:
-        dims (int): The feature dimension of the input to normalize over
+        dims (Union[int, Sequence[int]]): The feature dimension of the input to normalize over. If an integer is provided, it is treated as the feature dimension for 1D inputs. If a sequence of integers is provided, it specifies the dimensions along which the normalization is applied for 2D inputs.
         eps (float): A small additive constant for numerical stability
         affine (bool): If True learn an affine transform to apply after the
             normalization
@@ -150,13 +117,7 @@ class LayerNorm(Module):
         if len(weight.shape) == 1:
             return mx.fast.layer_norm(x, weight, bias, self.eps)
         else:
-            if self.affine:
-                if bias is not None:
-                    return ln_norm(x, self.eps, weight, bias)
-                else:
-                    return ln_norm(x, self.eps, weight)
-            else:
-                return ln_norm(x, self.eps)
+            return self.weight * mx.fast.layer_norm(x, None, bias, self.eps)
 
 
 class RMSNorm(Module):
