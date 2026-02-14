@@ -13,13 +13,10 @@
 #include "mlx/backend/cuda/steel/utils.cuh"
 #include "mlx/dtype_utils.h"
 
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace mlx::core::cu {
-
-namespace cg = cooperative_groups;
 
 // =============================================================================
 // Tile sizes for tensor core GEMM (128x128 tiles for better arithmetic intensity)
@@ -39,70 +36,6 @@ static constexpr int TC_WARP_M = TC_BM / TC_WARPS_M;  // 32
 static constexpr int TC_WARP_N = TC_BN / TC_WARPS_N;  // 64
 
 // =============================================================================
-// Legacy kernel tile sizes (for M <= 8 fallback)
-// =============================================================================
-static constexpr int BM = 64;
-static constexpr int BN = 64;
-static constexpr int BK = 32;
-static constexpr int QMM_BLOCK_SIZE = 256;
-
-// =============================================================================
-// Shared memory tile with swizzling for bank conflict avoidance
-// =============================================================================
-template <typename T, int ROWS, int COLS>
-struct SwizzledTile {
-  static constexpr int TILES_X = COLS / 16;
-  static constexpr int NUMEL = ROWS * COLS;
-
-  // Swizzle configuration based on tile width
-  static constexpr int swizzle_bytes =
-      (sizeof(T) == 2 ? (TILES_X % 4 == 0 ? 128 : (TILES_X % 2 == 0 ? 64 : 32))
-                      : (sizeof(T) == 4 ? (TILES_X % 2 == 0 ? 128 : 64) : 0));
-
-  T data[ROWS * COLS];
-
-  __device__ inline uint32_t base_addr() const {
-    return __cvta_generic_to_shared(&data[0]);
-  }
-
-  // Return pointer with swizzle applied
-  __device__ static inline T* ptr(T* base, int row, int col) {
-    if constexpr (swizzle_bytes > 0) {
-      static constexpr int swizzle_repeat = swizzle_bytes * 8;
-      static constexpr int subtile_cols = swizzle_bytes / sizeof(T);
-      const int outer_idx = col / subtile_cols;
-      const uint64_t addr =
-          (uint64_t)(&base[outer_idx * ROWS * subtile_cols + row * subtile_cols +
-                          col % subtile_cols]);
-      const int swizzle = ((addr % swizzle_repeat) >> 7) << 4;
-      return (T*)(addr ^ swizzle);
-    } else {
-      return base + row * COLS + col;
-    }
-  }
-
-  // Return shared memory address with swizzle
-  __device__ static inline uint32_t loc(uint32_t base, int row, int col) {
-    if constexpr (swizzle_bytes > 0) {
-      static constexpr int swizzle_repeat = swizzle_bytes * 8;
-      static constexpr int subtile_cols = swizzle_bytes / sizeof(T);
-      const int outer_idx = col / subtile_cols;
-      const uint32_t addr = base +
-          sizeof(T) * (outer_idx * ROWS * subtile_cols + row * subtile_cols +
-                       col % subtile_cols);
-      const int swizzle = ((addr % swizzle_repeat) >> 7) << 4;
-      return (addr ^ swizzle);
-    } else {
-      return base + sizeof(T) * (row * COLS + col);
-    }
-  }
-
-  __device__ inline T& operator()(int row, int col) {
-    return *ptr(data, row, col);
-  }
-};
-
-// =============================================================================
 // Dequantization helpers
 // =============================================================================
 
@@ -118,24 +51,6 @@ __device__ __forceinline__ float4 dequant_fp4_scaled(uint16_t bits, float scale)
   auto out = *(__nv_fp4x4_e2m1*)(&bits);
   float4 f = out.operator float4();
   return make_float4(f.x * scale, f.y * scale, f.z * scale, f.w * scale);
-}
-
-// Dequantize FP8 to bf16x2 (two values)
-__device__ __forceinline__ __nv_bfloat162 dequant_fp8_to_bf16x2(uint16_t bits, float scale) {
-  uint8_t b0 = bits & 0xFF;
-  uint8_t b1 = (bits >> 8) & 0xFF;
-  float f0 = float(*(__nv_fp8_e4m3*)(&b0)) * scale;
-  float f1 = float(*(__nv_fp8_e4m3*)(&b1)) * scale;
-  return __floats2bfloat162_rn(f0, f1);
-}
-
-// Dequantize FP4 to bf16x2 (two values)
-__device__ __forceinline__ __nv_bfloat162 dequant_fp4_to_bf16x2(uint8_t bits, float scale) {
-  uint8_t nibble0 = bits & 0x0F;
-  uint8_t nibble1 = (bits >> 4) & 0x0F;
-  float f0 = float(*(__nv_fp4_e2m1*)(&nibble0)) * scale;
-  float f1 = float(*(__nv_fp4_e2m1*)(&nibble1)) * scale;
-  return __floats2bfloat162_rn(f0, f1);
 }
 
 // Load scale factor and convert to float
@@ -154,14 +69,6 @@ __device__ __forceinline__ float load_scale(const uint8_t* scales, int idx) {
 // =============================================================================
 struct Tile16x16_bf16 {
   __nv_bfloat162 values[4];  // Each thread holds 8 bf16 values as 4 bf16x2
-
-  __device__ inline void fill(__nv_bfloat16 v) {
-    __nv_bfloat162 v2 = {v, v};
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      values[i] = v2;
-    }
-  }
 
   // Load 16x16 tile from shared memory using ldmatrix
   __device__ __forceinline__ void load(uint32_t row_address) {
