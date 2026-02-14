@@ -51,7 +51,14 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& device = encoder.device();
 
   bool w_quantized = (inputs[1].dtype() == uint32);
-  if (w_quantized && inputs[0].shape(-2) == 1) {
+
+  // Check compute capability for full QQMM support
+  auto cc = device.compute_capability_major() * 100 +
+      device.compute_capability_minor() * 10;
+
+  // For w_quantized cases: use fp_qmv path which works on all GPUs
+  // This path applies quantize/dequantize to x, then uses the fp_qmv kernel
+  if (w_quantized && (inputs[0].shape(-2) == 1 || cc < 1000)) {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
 
     bool donate_x = inputs[0].is_donatable();
@@ -79,8 +86,7 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  auto cc = device.compute_capability_major() * 100 +
-      device.compute_capability_minor() * 10;
+  // For cc >= 1000, use full QQMM with cuBLAS block-scaled matmul
   if (cc < 1000) {
     throw std::runtime_error(
         "[QQMatmul::eval_gpu] QQMM is only supported on GPUs with compute capability 10.0 or higher.");
