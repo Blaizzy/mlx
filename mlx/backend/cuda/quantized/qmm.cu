@@ -22,21 +22,21 @@ namespace mlx::core::cu {
 namespace cg = cooperative_groups;
 
 // =============================================================================
-// Tile sizes for tensor core GEMM
+// Tile sizes for tensor core GEMM (128x128 tiles for better arithmetic intensity)
 // =============================================================================
-static constexpr int TC_BM = 64;  // Rows of output tile (M dimension)
-static constexpr int TC_BN = 64;  // Cols of output tile (N dimension)
-static constexpr int TC_BK = 32;  // Reduction dimension tile (K dimension)
+static constexpr int TC_BM = 128;  // Rows of output tile (M dimension)
+static constexpr int TC_BN = 128;  // Cols of output tile (N dimension)
+static constexpr int TC_BK = 32;   // Reduction dimension tile (K dimension)
 
-// Thread block configuration: 4 warps = 128 threads
-static constexpr int TC_WARPS_M = 2;
+// Thread block configuration: 8 warps = 256 threads (for 128x128 tiles)
+static constexpr int TC_WARPS_M = 4;
 static constexpr int TC_WARPS_N = 2;
 static constexpr int TC_NUM_WARPS = TC_WARPS_M * TC_WARPS_N;
 static constexpr int TC_BLOCK_SIZE = TC_NUM_WARPS * 32;
 
 // Each warp handles this much of the output tile
 static constexpr int TC_WARP_M = TC_BM / TC_WARPS_M;  // 32
-static constexpr int TC_WARP_N = TC_BN / TC_WARPS_N;  // 32
+static constexpr int TC_WARP_N = TC_BN / TC_WARPS_N;  // 64
 
 // =============================================================================
 // Legacy kernel tile sizes (for M <= 8 fallback)
@@ -312,10 +312,10 @@ __global__ void fp_qmm_tensor_core_kernel(
   __nv_bfloat16* x_tile = (__nv_bfloat16*)shmem;
   __nv_bfloat16* w_tile = x_tile + TC_BM * TC_BK;
 
-  // Accumulator tiles (2x2 = 4 tiles of 16x16 for 32x32 output per warp)
-  Tile16x16_f32 C[4];
+  // Accumulator tiles (2x4 = 8 tiles of 16x16 for 32x64 output per warp)
+  Tile16x16_f32 C[8];
   #pragma unroll
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 8; i++) {
     C[i].fill(0.0f);
   }
 
@@ -391,15 +391,11 @@ __global__ void fp_qmm_tensor_core_kernel(
     __syncthreads();
 
     // Compute with tensor cores
-    // Each warp computes a 32x32 portion using 2x2 16x16 tiles
+    // Each warp computes a 32x64 portion using 2x4 16x16 tiles
     #pragma unroll
     for (int k = 0; k < TC_BK / 16; k++) {
-      // Load A and B fragments using ldmatrix
+      // Load A fragments (2 tiles along M)
       Tile16x16_bf16 A[2];
-      Tile16x16_bf16 B[2];
-
-      // Compute addresses for ldmatrix
-      // ldmatrix needs address pointing to start of 8x8 block for this thread group
       const int a_row = warp_offset_m + (laneid % 16);
       const int a_col = k * 16 + (laneid / 16) * 8;
       const uint32_t x_base = __cvta_generic_to_shared(x_tile);
@@ -407,53 +403,60 @@ __global__ void fp_qmm_tensor_core_kernel(
       A[0].load(x_base + sizeof(__nv_bfloat16) * (a_row * TC_BK + a_col));
       A[1].load(x_base + sizeof(__nv_bfloat16) * ((a_row + 16) * TC_BK + a_col));
 
-      const int b_row = warp_offset_n + (laneid % 16);
+      // Load B fragments (4 tiles along N)
+      Tile16x16_bf16 B[4];
       const int b_col = k * 16 + (laneid / 16) * 8;
       const uint32_t w_base = __cvta_generic_to_shared(w_tile);
 
-      B[0].load(w_base + sizeof(__nv_bfloat16) * (b_row * TC_BK + b_col));
-      B[1].load(w_base + sizeof(__nv_bfloat16) * ((b_row + 16) * TC_BK + b_col));
+      #pragma unroll
+      for (int bn = 0; bn < 4; bn++) {
+        const int b_row = warp_offset_n + bn * 16 + (laneid % 16);
+        B[bn].load(w_base + sizeof(__nv_bfloat16) * (b_row * TC_BK + b_col));
+      }
 
-      // 2x2 MMA operations
-      mma_bf16(C[0], A[0], B[0]);
-      mma_bf16(C[1], A[0], B[1]);
-      mma_bf16(C[2], A[1], B[0]);
-      mma_bf16(C[3], A[1], B[1]);
+      // 2x4 MMA operations
+      #pragma unroll
+      for (int bn = 0; bn < 4; bn++) {
+        mma_bf16(C[bn * 2 + 0], A[0], B[bn]);
+        mma_bf16(C[bn * 2 + 1], A[1], B[bn]);
+      }
     }
 
     __syncthreads();
   }
 
   // ==========================================================================
-  // Write results to global memory
+  // Write results to global memory (32x64 per warp = 2x4 16x16 tiles)
   // ==========================================================================
-  int out_row_base = bm + warp_offset_m;
-  int out_col_base = bn + warp_offset_n;
+  const int out_row_base = bm + warp_offset_m;
+  const int out_col_base = bn + warp_offset_n;
 
   // Check if we need bounds checking
-  bool need_bounds = (out_row_base + 32 > M) || (out_col_base + 32 > N);
+  const bool need_bounds = (out_row_base + 32 > M) || (out_col_base + 64 > N);
 
   if (!need_bounds) {
-    // Fast path: full tile write
-    C[0].store_global(out + out_row_base * N + out_col_base, N);
-    C[1].store_global(out + out_row_base * N + (out_col_base + 16), N);
-    C[2].store_global(out + (out_row_base + 16) * N + out_col_base, N);
-    C[3].store_global(out + (out_row_base + 16) * N + (out_col_base + 16), N);
+    // Fast path: full tile write (2 rows x 4 cols of 16x16 tiles)
+    #pragma unroll
+    for (int bn = 0; bn < 4; bn++) {
+      C[bn * 2 + 0].store_global(out + out_row_base * N + (out_col_base + bn * 16), N);
+      C[bn * 2 + 1].store_global(out + (out_row_base + 16) * N + (out_col_base + bn * 16), N);
+    }
   } else {
     // Slow path: bounds-checked write
-    int max_rows_0 = min(16, M - out_row_base);
-    int max_rows_1 = min(16, M - out_row_base - 16);
-    int max_cols_0 = min(16, N - out_col_base);
-    int max_cols_1 = min(16, N - out_col_base - 16);
+    #pragma unroll
+    for (int bn = 0; bn < 4; bn++) {
+      const int col_offset = out_col_base + bn * 16;
+      const int max_cols = min(16, N - col_offset);
+      if (max_cols <= 0) continue;
 
-    if (max_rows_0 > 0 && max_cols_0 > 0)
-      C[0].store_global_safe(out + out_row_base * N + out_col_base, N, max_rows_0, max_cols_0);
-    if (max_rows_0 > 0 && max_cols_1 > 0)
-      C[1].store_global_safe(out + out_row_base * N + (out_col_base + 16), N, max_rows_0, max_cols_1);
-    if (max_rows_1 > 0 && max_cols_0 > 0)
-      C[2].store_global_safe(out + (out_row_base + 16) * N + out_col_base, N, max_rows_1, max_cols_0);
-    if (max_rows_1 > 0 && max_cols_1 > 0)
-      C[3].store_global_safe(out + (out_row_base + 16) * N + (out_col_base + 16), N, max_rows_1, max_cols_1);
+      const int max_rows_0 = min(16, M - out_row_base);
+      const int max_rows_1 = min(16, M - out_row_base - 16);
+
+      if (max_rows_0 > 0)
+        C[bn * 2 + 0].store_global_safe(out + out_row_base * N + col_offset, N, max_rows_0, max_cols);
+      if (max_rows_1 > 0)
+        C[bn * 2 + 1].store_global_safe(out + (out_row_base + 16) * N + col_offset, N, max_rows_1, max_cols);
+    }
   }
 }
 
